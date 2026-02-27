@@ -1,0 +1,492 @@
+---
+title: "stats101c_project"
+author: "SangHyun Kim (806394855)"
+date: "2025-11-24"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading in Data
+
+```{r}
+library(tidyverse)
+C.train <- read_csv("SkinCancerTrain.csv")
+C.test <- read_csv("SkinCancerTestNoY.csv")
+```
+
+# Imputing Missing Values
+
+```{r}
+# Get rid of the index column
+C.train <- C.train[, -1]
+C.test <- C.test[, -1]
+
+# Convert character to factor
+C.train <- C.train |> mutate(across(where(is.character), as.factor))
+C.test <- C.test |> mutate(across(where(is.character), as.factor))
+
+# Missing Values
+num_cols <- C.train |> select(where(is.numeric)) |> colnames()
+num_cols
+cat_cols <- setdiff(names(C.train), c(num_cols, "Cancer"))
+cat_cols
+
+get_mode <- function(x) {
+  x <- x[!is.na(x)]         # remove NAs first
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+for (col in num_cols) {
+  med <- median(C.train[[col]], na.rm = TRUE)
+  C.train[[col]][is.na(C.train[[col]])] <- med
+  C.test[[col]][is.na(C.test[[col]])] <- med
+}
+
+for (col in cat_cols) {
+  mode1 <- get_mode(C.train[[col]])
+  C.train[[col]][is.na(C.train[[col]])] <- mode1
+  C.test[[col]][is.na(C.test[[col]])] <- mode1
+}
+
+
+```
+
+
+# Variable Selection
+
+```{r}
+# Chi square test using categorical variables
+chi_results <- data.frame(
+  variable = character(),
+  p_value = numeric(),
+  test_used = character(),
+  stringsAsFactors = FALSE
+)
+
+for (col in cat_cols) {
+
+  tab <- table(C.train[[col]], C.train$Cancer)
+
+    test <- chisq.test(tab)
+    p <- test$p.value
+
+  chi_results <- rbind(
+    chi_results,
+    data.frame(variable = col, p_value = p)
+  )
+}
+
+# Sort by significance
+chi_results <- chi_results |> arrange(p_value)
+chi_results
+```
+
+```{r}
+# ANOVA test using numerical variables
+num_cols <- C.train |> 
+  select(where(is.numeric)) |> 
+  colnames()
+
+anova_results <- data.frame(
+  variable = character(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (col in num_cols) {
+  f <- as.formula(paste(col, "~ Cancer"))
+  test <- aov(f, data = C.train)
+  p <- summary(test)[[1]][["Pr(>F)"]][1]
+  
+  anova_results <- rbind(
+    anova_results,
+    data.frame(variable = col, p_value = p)
+  )
+}
+
+anova_results <- anova_results |> arrange(p_value)
+anova_results
+```
+
+```{r}
+# Drop insignificant categorical and numerical variables
+drop_cat <- chi_results |> 
+  filter(p_value >= 0.08) |> 
+  pull(variable)
+
+C.train_reduced <- C.train |> select(-all_of(drop_cat))
+C.test_reduced  <- C.test  |> select(-all_of(drop_cat))
+
+drop_numeric <- anova_results |> 
+  filter(p_value >= 0.05) |> 
+  pull(variable)
+
+C.train_reduced <- C.train_reduced |> select(-all_of(drop_numeric))
+C.test_reduced  <- C.test_reduced  |> select(-all_of(drop_numeric))
+```
+
+```{r}
+# Scale the numerical variables for (logistic regression, LDA, QDA)
+num_cols_reduced <- C.train_reduced |> 
+  select(where(is.numeric)) |> 
+  colnames()
+
+library(caret)
+preproc <- preProcess(
+  C.train_reduced[, num_cols_reduced],
+  method = c("center", "scale")
+)
+
+C.train_scaled <- C.train_reduced
+C.test_scaled  <- C.test_reduced
+
+C.train_scaled[, num_cols_reduced] <- predict(preproc, C.train_reduced[, num_cols_reduced])
+C.test_scaled[,  num_cols_reduced] <- predict(preproc, C.test_reduced[, num_cols_reduced])
+```
+
+```{r}
+# Hot-encoding categorical variables
+
+# Remove the target from training before encoding
+target <- C.train_scaled$Cancer
+C.train_scaled$Cancer <- NULL
+
+# Create dummy encoder from training set only
+dummies <- dummyVars(" ~ .", data = C.train_scaled)
+
+# Apply to both train and test
+train_final <- predict(dummies, newdata = C.train_scaled) |> as.data.frame()
+test_final  <- predict(dummies, newdata = C.test_scaled)  |> as.data.frame()
+
+# Add target back to training data
+train_final$Cancer <- target
+C.train_scaled$Cancer <- target
+```
+
+# Models
+
+## Logistic Regression with CV (0.60350)
+
+```{r}
+cv_ctrl <- trainControl(method = "cv", number = 10)
+logit_cv <- train(Cancer ~ ., data = train_final, method = "multinom",
+trControl = cv_ctrl, trace = FALSE)
+
+logit_preds <- predict(logit_cv, newdata = test_final)
+
+logit_cv$results  # shows cross-validated accuracy
+confusionMatrix(predict(logit_cv, newdata = train_final), train_final$Cancer)
+
+submission_logit <- tibble(
+  ID = 1:nrow(C.test_scaled), Cancer = logit_preds
+)
+
+write_csv(submission_logit, "submission_logit4.csv")
+```
+
+## KNN
+
+```{r}
+knn_train_final <- train_final
+knn_train_final$uv_x_spf <- NULL
+knn_train_final$hat_outdoor <- NULL
+knn_train_final$photo_x_burn <- NULL
+
+knn_test_final <- test_final
+knn_test_final$uv_x_spf <- NULL
+knn_test_final$hat_outdoor <- NULL
+knn_test_final$photo_x_burn <- NULL
+
+cv_ctrl <- trainControl(method = "cv", number = 10, classProbs = TRUE)
+
+set.seed(1)
+knn_model <- train(Cancer ~ ., data = knn_train_final, method = "knn", 
+                   tuneGrid = expand.grid(k = seq(3, 21, 2)), 
+                   trControl = cv_ctrl)
+
+knn_model_high_k <- train(Cancer ~ ., data = knn_train_final, method = "knn", 
+                          tuneGrid = expand.grid(k = seq(15, 51, 2)), 
+                          trControl = cv_ctrl)
+
+
+plot(knn_model_high_k)
+knn_model_high_k$bestTune  # Best value of k
+
+knn_preds <- predict(knn_model_high_k, newdata = knn_test_final)
+submission_knn <- tibble(
+  ID = 1:nrow(knn_test_final),
+  Cancer = knn_preds
+)
+write_csv(submission_knn, "submission_knn.csv")
+```
+
+## LASSO
+
+```{r}
+# UV x SPF
+train_final$uv_x_spf <- train_final$avg_daily_uv * train_final$sunscreen_spf
+test_final$uv_x_spf <- test_final$avg_daily_uv * test_final$sunscreen_spf
+
+# Hat use often x outdoor job
+if ("hat_use.Often" %in% names(train_final)) {
+  train_final$hat_outdoor <- train_final$outdoor_job * train_final$`hat_use.Often`
+  test_final$hat_outdoor <- test_final$outdoor_job * test_final$`hat_use.Often`
+}
+
+# Skin photosensitivity x high exposure
+if ("skin_photosensitivity.High" %in% names(train_final)) {
+  train_final$photo_x_burn <- train_final$`skin_photosensitivity.High` * train_final$sunburns_last_year
+  test_final$photo_x_burn <- test_final$`skin_photosensitivity.High` * test_final$sunburns_last_year
+}
+
+# Age 
+
+x <- as.matrix(train_final |> select(-Cancer))  # predictors
+y <- ifelse(train_final$Cancer == "Malignant", 1, 0)  # binary target
+x_test <- as.matrix(test_final)
+
+set.seed(1)
+
+cvfit <- cv.glmnet(
+  x = x,
+  y = y,
+  family = "binomial",
+  alpha = 1,            # 1 = LASSO; try 0.5 for Elastic Net later
+  type.measure = "auc", # Better than default "class" for imbalanced problems
+  nfolds = 5
+)
+
+plot(cvfit)  # visualize lambda vs AUC
+
+# Best lambda based on max AUC
+best_lambda <- cvfit$lambda.min
+best_lambda
+coef(cvfit, s = best_lambda)
+coef(cvfit, s = "lambda.1se")
+
+# Predict probabilities
+prob <- predict(cvfit, newx = x_test, s = best_lambda, type = "response")
+
+# Class prediction
+pred <- ifelse(prob > 0.5, "Malignant", "Benign")
+
+# Create submission
+submission <- tibble(
+  ID = 1:nrow(C.test_scaled),
+  Cancer = as.vector(pred)
+)
+
+write_csv(submission2, "submission_lasso_1se.csv")
+```
+
+## Logit with Less Predictors
+
+```{r}
+selected_vars <- rownames(coef(cvfit, s = "lambda.1se"))[coef(cvfit, s = "lambda.1se")[,1] != 0]
+selected_vars <- setdiff(selected_vars, "(Intercept)")
+selected_vars_safe <- paste0("`", selected_vars, "`")  # backtick them
+selected_vars
+
+# Build formula string
+formula_str <- paste("Cancer ~", paste(selected_vars_safe, collapse = " + "))
+formula_obj <- as.formula(formula_str)
+
+# Fit unpenalized logistic regression
+post_lasso_model <-  train(formula_obj, data = train_final, method = "multinom",
+                           trControl = cv_ctrl, trace = FALSE)
+
+post_lasso_preds <- predict(post_lasso_model, newdata = test_final)
+
+post_lasso_model$results  # shows cross-validated accuracy
+confusionMatrix(predict(post_lasso_model, newdata = train_final), train_final$Cancer)
+
+submission_logit_post_lasso <- tibble(
+  ID = 1:nrow(C.test_scaled), Cancer = post_lasso_preds
+)
+
+write_csv(submission_logit_post_lasso, "submission_logit_post_lasso2.csv")
+```
+
+
+## Random Forest
+
+```{r}
+library(randomForest)
+
+set.seed(123)
+
+x <- train_final |> select(-Cancer)
+y <- train_final$Cancer
+
+rf_model <- randomForest(
+  x = x,
+  y = y,
+  ntree = 500,
+  mtry = sqrt(ncol(x)),
+  importance = TRUE
+)
+
+rf_preds <- predict(rf_model, newdata = test_final)
+
+submission_rf <- tibble(
+  ID = 1:nrow(C.test_scaled),  # Or use original ID column if available
+  Cancer = rf_preds
+)
+
+
+write_csv(submission_rf, "submission_random_forest.csv")
+```
+
+## LDA
+
+```{r}
+num_cols <- C.train_scaled |> select(where(is.numeric)) |> colnames()
+
+lda_train <- train_final[, c(num_cols, "Cancer")]
+lda_test <- test_final[, num_cols]
+
+library(MASS)
+lda_model <- lda(Cancer ~ ., data = lda_train)
+lda_preds <- predict(lda_model, newdata = lda_test)$class
+
+lda_preds
+
+submission_lda <- tibble(
+  ID = 1:nrow(lda_test),  # or original test IDs if available
+  Cancer = lda_preds
+)
+
+write_csv(submission_lda, "submission_lda.csv")
+```
+
+## Logistic Regression + BIC
+
+```{r}
+set.seed(1)
+
+full_model <- glm(Cancer ~ ., data = train_final, family = "binomial")
+bic_model <- step(full_model, direction = "backward", k = log(nrow(train_final)))
+bic_formula <- formula(bic_model)
+bic_formula
+summary(bic_model)
+
+set.seed(123)
+
+cv_model <- train(
+  bic_formula,
+  data = train_final,
+  method = "glm",
+  family = "binomial",
+  trControl = cv_ctrl,
+)
+
+summary(cv_model)
+
+bic_preds <- predict(cv_model, newdata = test_final)
+
+submission_bic <- tibble(
+  ID = 1:nrow(lda_test),  # or original test IDs if available
+  Cancer = bic_preds
+)
+
+write_csv(submission_bic, "submission_bic.csv")
+
+```
+
+## Logistic Regression + XGBoost
+
+```{r}
+bic_predictors <- c(
+  "age", "skin_tone.Brown", "skin_tone.Dark", "skin_tone.Fair",
+  "skin_tone.Medium", "skin_tone.Olive", "avg_daily_uv",
+  "sunscreen_freq.Always", "sunscreen_freq.Often",
+  "hat_use.Never", "clothing_protection.High", "clothing_protection.Low",
+  "tanning_bed_use.Never", "tanning_bed_use.Often", "outdoor_job",
+  "family_history.1st-degree", "family_history.2nd-degree",
+  "immunosuppressed.No", "lesion_size_mm", "number_of_lesions",
+  "skin_photosensitivity.High", "skin_photosensitivity.Low",
+  "sunburns_last_year"
+)
+x_train <- as.matrix(train_final[, bic_predictors])
+y_train <- ifelse(train_final$Cancer == "Malignant", 1, 0)
+x_test <- as.matrix(test_final[, bic_predictors])
+
+
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest <- xgb.DMatrix(data = x_test)
+
+set.seed(123)
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "binary:logistic",
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.1,
+  verbose = 0
+)
+
+xgb_probs <- predict(xgb_model, dtest)
+
+ensemble_probs <- (xgb_probs + bic_probs) / 2
+final_preds <- ifelse(ensemble_probs > 0.5, "Malignant", "Benign")
+
+submission_bic_boost <- tibble(
+  ID = 1:nrow(test_final),
+  Cancer = final_preds
+)
+
+write_csv(submission_bic_boost, "submission_bic_boost.csv")
+```
+
+## Logit + Fixing the Skew on Numerical Variables
+
+```{r}
+true_numeric_vars <- c("age", "avg_daily_uv", "lesion_size_mm", "number_of_lesions", "sunburns_last_year")
+skew_vals <- sapply(train_final[, true_numeric_vars], skewness)
+print(skew_vals)
+
+for (var in true_numeric_vars) {
+  print(
+    ggplot(train_final, aes_string(x = var)) +
+      geom_histogram(aes(y = ..density..), bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+      geom_density(color = "darkblue", size = 1) +
+      ggtitle(paste("Histogram & Density of", var)) +
+      theme_minimal()
+  )
+}
+
+train_final_skew <- train_final
+train_final_skew$number_of_lesions <- log1p(train_final_skew$number_of_lesions)
+train_final_skew$sunburns_last_year <- log1p(train_final_skew$sunburns_last_year)
+test_final_skew <- test_final
+test_final_skew$number_of_lesions <- log1p(test_final_skew$number_of_lesions)
+test_final_skew$sunburns_last_year <- log1p(test_final_skew$sunburns_last_year)
+sapply(train_final_skew[c("number_of_lesions", "sunburns_last_year")], skewness)
+
+set.seed(123)
+
+cv_model <- train(
+  bic_formula,
+  data = train_final_skew,
+  method = "glm",
+  family = "binomial",
+  trControl = cv_ctrl,
+)
+
+# Step 5: Review cross-validated AUC
+
+bic_skew_preds <- predict(cv_model, newdata = test_final_skew)
+
+submission_bic_skew <- tibble(
+  ID = 1:nrow(test_final),  # or original test IDs if available
+  Cancer = bic_skew_preds
+)
+
+write_csv(submission_bic_skew, "submission_bic_skew.csv")
+```
+
